@@ -72,6 +72,26 @@ model.
   read. A command that waited for another one's turn is checked again, who asked, file and
   approval, before it starts; one refused then ran nothing, so the project's `remove` does not run
   for it either.
+- **A repository's push hooks run for an agent below Full access only as a person approved
+  them.** `pull_request_create` pushes as the server's OS user, and Git would run the checkout's
+  `pre-push` and `reference-transaction` hooks, which the agent may have written. By the rule
+  above for who is in Full access, a thread below it gets every Git command of that call with
+  hooks off (`GitVcsDriver.RepositoryHooks`), except the push itself once a person approved the
+  hook files by a digest of their contents. The driver reads the files again as its last step
+  before starting that push, and anything but the approved digest pushes nothing and asks again.
+  The approved push gets a temporary hooks directory of its own, holding one launcher per approved
+  hook that starts the hook by its own path (so husky's `$0`-relative lookups still work); a file
+  that appears among the repository's hooks during the push is not run. The digest covers the
+  files it names and no more: each hook file Git starts and, where that file is the shim husky 9
+  and Vite+ install (`. "$(dirname "$0")/h"`), the runner `h` beside it and the script of the
+  hook's name one directory up, such as `.husky/pre-push`. A named file edited after that last
+  read and before Git starts it runs as edited.
+  The tool asks by MCP elicitation
+  ([`McpClientInput`](../../apps/server/src/mcp/McpClientInput.ts)): a sessionless client is
+  answered with the request and calls the tool again with the reply, so a handler that asks must
+  be safe to run from the start twice. A client that cannot be asked gets the push with hooks off.
+  What those files go on to run, such as a package script or a file they source, is not part of
+  the digest, so an approval is for the named files and not for everything the push executes.
 - **Peer-link client pairing.** Only a full-access peer link may mint a one-time client pairing on
   the linked environment (since full-access agents can already run `t3 auth pairing create`). The
   linked side enforces this itself, and the operation stays a human-triggered RPC/HTTP route rather

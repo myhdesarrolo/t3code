@@ -20,6 +20,16 @@ and modes you choose in a draft keep their permissions.
 An administrator can cap the modes available on a machine with a
 [managed policy](./managed-policy.md#permission-modes); modes above the cap show who manages them.
 
+When an agent below **Full access** opens a pull request and the push would run one of the
+repository's Git hooks (`pre-push` or `reference-transaction`, as a project with husky has), T3
+Code asks you first. The request names the branch and the hook files. **Approve** pushes and runs
+them; **Decline** pushes nothing. An approval covers the contents of the files it names: if one
+of them changes, you are asked again. With husky that is the hook's script, such as
+`.husky/pre-push`, along with the files husky generates to start it. It does not cover what those
+files go on to run, such as a package script, so a change there is not asked about. A push that
+would run no hook is not asked about. An agent whose provider cannot show the request pushes
+without running the hooks and is told so.
+
 Approve or reject requests in the conversation to let the agent continue. Permission modes do
 not prevent the agent from asking questions about the task. Subagent approval requests appear in
 the parent conversation with the subagent's name, so you can respond without switching threads.

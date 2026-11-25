@@ -43,6 +43,9 @@ import {
   threadPullRequestsOf,
   visibleThreadPullRequests,
 } from "../../../sourceControl/threadPullRequests.ts";
+import * as ServerSettings from "../../../serverSettings.ts";
+import * as TaskFolders from "../../../workspace/TaskFolders.ts";
+import * as McpClientInput from "../../McpClientInput.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import { threadNotFound } from "../../threadAccess.ts";
@@ -262,6 +265,43 @@ function projectForPullRequest(
   return projects.find(matches);
 }
 
+const isPushHooksUnapproved = Schema.is(GitManager.GitPushHooksUnapprovedError);
+
+const PUSH_HOOKS_DECLINED =
+  "The person declined to run this repository's push hooks. Nothing was pushed and no PR was opened.";
+const PUSH_HOOKS_KEPT_CHANGING =
+  "This repository's push hooks kept changing while approval was asked. Nothing was pushed.";
+const PUSH_HOOKS_SKIPPED =
+  "The repository's push hooks were not run, because this client cannot ask a person to approve them.";
+
+// Each request is followed by one push, so the last approval is tried too.
+const PUSH_HOOKS_MAX_REQUESTS = 3;
+
+/**
+ * What one approval is given for, and so what a client that remembers approvals remembers it by:
+ * the contents of the named files. The request's state carries these whole and its text the
+ * start of each, so edited files read differently and are asked about again.
+ */
+const pushHooksApprovalKey = (hooks: GitManager.GitPushHooksUnapprovedError) => [hooks.digest];
+
+/** What the person approves: the push, the files named, and the start of the approval's key. */
+const pushHooksQuestion = (cwd: string, hooks: GitManager.GitPushHooksUnapprovedError) => {
+  // Hooks kept in the checkout read as the person knows them, such as `.husky/pre-push`.
+  const files = hooks.files.map((file) =>
+    file.startsWith(cwd) && /^[\\/]/.test(file.slice(cwd.length))
+      ? file.slice(cwd.length + 1)
+      : file,
+  );
+  const named =
+    files.length === 1
+      ? `hook file ${files[0]}`
+      : `hook files ${files.slice(0, -1).join(", ")} and ${files.at(-1)}`;
+  const key = pushHooksApprovalKey(hooks)
+    .map((part) => part.slice(0, 8))
+    .join(" ");
+  return `Push ${hooks.branch} and run this repository's ${named} (contents ${key})?`;
+};
+
 const make = Effect.gen(function* () {
   const engine = yield* Orchestrator.OrchestratorV2;
   const reviewGuides = yield* PullRequestReviewGuideService.PullRequestReviewGuideService;
@@ -271,6 +311,9 @@ const make = Effect.gen(function* () {
 
   const projects = yield* ProjectService.ProjectService;
   const random = yield* SecureRandom.SecureRandom;
+  // The administrator's limit, fixed for the server's life as it is where turns start.
+  const maxRuntimeMode = (yield* ServerSettings.ServerSettingsService).managedPolicy?.limits
+    ?.maxRuntimeMode;
 
   const commandId = (tag: string, threadId: ThreadId) =>
     random.uuidV4().pipe(
@@ -1057,17 +1100,77 @@ const make = Effect.gen(function* () {
         if (project === undefined) {
           return yield* new PullRequestProjectNotFoundError({ repository: "" });
         }
-        const created = yield* git
-          .createPullRequest({
-            cwd: thread.worktreePath ?? project.workspaceRoot,
-            projectId: project.id,
-            title: input.title,
-            body: input.body,
-            baseBranch: input.base,
-            draft: input.draft,
-            private: input.private,
-          })
-          .pipe(Effect.mapError(forgeFailure));
+        const cwd = thread.worktreePath ?? project.workspaceRoot;
+        const create = (
+          pushHooks?: Parameters<
+            GitManager.GitManager["Service"]["createPullRequest"]
+          >[0]["pushHooks"],
+        ) =>
+          git
+            .createPullRequest({
+              cwd,
+              projectId: project.id,
+              title: input.title,
+              body: input.body,
+              baseBranch: input.base,
+              draft: input.draft,
+              private: input.private,
+              pushHooks,
+            })
+            .pipe(
+              Effect.mapError((error) =>
+                isPushHooksUnapproved(error) ? error : forgeFailure(error),
+              ),
+            );
+        // The repository's push hooks are its owner's code. Below Full access the agent's own
+        // commands wait for a person, so these do too: by the rule a worktree's commands follow.
+        const fullAccess =
+          TaskFolders.projectCommandsForAgent(thread.linkOrigin, thread, maxRuntimeMode) ===
+          "permitted";
+        let hooksSkipped = false;
+        const createOnceApproved = Effect.gen(function* () {
+          let approvedDigest: string | null = null;
+          // A hook edited while the person reads the question is asked about again; the limit
+          // bounds one that keeps changing.
+          for (let requests = 0; ; requests++) {
+            const outcome:
+              | GitManager.GitCreatePullRequestResult
+              | GitManager.GitPushHooksUnapprovedError = yield* create({ approvedDigest }).pipe(
+              Effect.catchTags({
+                GitPushHooksUnapprovedError: (unapproved) => Effect.succeed(unapproved),
+              }),
+            );
+            if (!isPushHooksUnapproved(outcome)) return outcome;
+            if (requests === PUSH_HOOKS_MAX_REQUESTS) {
+              return yield* new PullRequestForgeError({ detail: PUSH_HOOKS_KEPT_CHANGING });
+            }
+            const answer = yield* McpClientInput.askApproval({
+              key: "push-hooks",
+              state: pushHooksApprovalKey(outcome).join(" "),
+              message: pushHooksQuestion(cwd, outcome),
+            });
+            if (answer === "accepted") {
+              approvedDigest = outcome.digest;
+              continue;
+            }
+            if (answer === "unavailable") {
+              hooksSkipped = true;
+              return yield* create("off").pipe(
+                Effect.catchTags({ GitPushHooksUnapprovedError: forgeFailure }),
+              );
+            }
+            return yield* new PullRequestForgeError({
+              detail:
+                answer === "declined"
+                  ? PUSH_HOOKS_DECLINED
+                  : // Never read: the question is this call's answer.
+                    "Waiting for approval.",
+            });
+          }
+        });
+        const created = yield* fullAccess
+          ? create().pipe(Effect.catchTags({ GitPushHooksUnapprovedError: forgeFailure }))
+          : createOnceApproved;
         if (created.url === undefined) {
           return yield* new PullRequestForgeError({
             detail:
@@ -1079,6 +1182,7 @@ const make = Effect.gen(function* () {
         return {
           ...identityOf(target),
           created: created.status === "created",
+          ...(hooksSkipped ? { note: PUSH_HOOKS_SKIPPED } : {}),
           ...(thread.lineage.relationshipToParent === "subagent"
             ? { next: CHILD_PULL_REQUEST_REPORT_NEXT }
             : {}),

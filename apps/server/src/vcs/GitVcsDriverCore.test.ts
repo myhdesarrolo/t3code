@@ -10743,6 +10743,173 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect("runs approved push hooks only while they are the files that were approved", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const remote = yield* makeTmpDir("git-hooked-remote-");
+        yield* initRepoWithCommit(cwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* git(cwd, ["branch", "-M", "main"]);
+        yield* git(remote, ["init", "--bare"]);
+        yield* git(cwd, ["remote", "add", "origin", remote]);
+        assert.isNull(yield* driver.pushHooks(cwd));
+
+        // Kept in a linked worktree's checkout, as a project with husky has them.
+        const worktree = NodePath.join(yield* makeTmpDir("git-hooked-worktree-"), "topic");
+        yield* git(cwd, ["config", "core.hooksPath", ".husky"]);
+        yield* git(cwd, ["worktree", "add", "-b", "topic", worktree]);
+        const hook = NodePath.join(worktree, ".husky", "pre-push");
+        const ran = NodePath.join(yield* makeTmpDir("git-hook-ran-"), "ran");
+        NodeFS.mkdirSync(NodePath.dirname(hook));
+        const writeHook = (label: string) =>
+          NodeFS.writeFileSync(hook, `#!/bin/sh\necho ${label} >> '${ran}'\n`, { mode: 0o755 });
+        writeHook("first");
+        const approved = yield* driver.pushHooks(worktree);
+        assert.deepEqual(approved?.files, [NodeFS.realpathSync(hook)]);
+        if ((yield* HostProcess.Platform) !== "win32") {
+          // A file Git may not execute is not a hook it would run.
+          NodeFS.chmodSync(hook, 0o644);
+          assert.isNull(yield* driver.pushHooks(worktree));
+          NodeFS.chmodSync(hook, 0o755);
+        }
+
+        writeHook("second");
+        const push = (digest: string | null) =>
+          driver.pushCurrentBranch(worktree, null).pipe(
+            Effect.provideService(GitVcsDriver.RepositoryHooks, {
+              _tag: "approved-push",
+              digest,
+            }),
+          );
+        const pushedTopic = git(cwd, ["ls-remote", "origin", "refs/heads/topic"]);
+        for (const digest of [approved!.digest, null]) {
+          const refused = yield* push(digest).pipe(Effect.flip);
+          assert.instanceOf(refused.cause, GitVcsDriver.PushHooksUnapprovedError);
+          assert.equal(yield* pushedTopic, "");
+          assert.isFalse(NodeFS.existsSync(ran));
+        }
+
+        const current = yield* driver.pushHooks(worktree);
+        assert.notEqual(current?.digest, approved?.digest);
+        assert.deepInclude(yield* push(current!.digest), { status: "pushed", branch: "topic" });
+        assert.equal(NodeFS.readFileSync(ran, "utf8"), "second\n");
+        assert.notEqual(yield* pushedTopic, "");
+      }),
+    );
+
+    /** A checkout on `topic` with a remote to push to, and `push` under an approval for `digest`. */
+    const repoToPush = Effect.fn(function* () {
+      const cwd = yield* makeTmpDir();
+      const remote = yield* makeTmpDir("git-hooked-remote-");
+      yield* initRepoWithCommit(cwd);
+      const driver = yield* GitVcsDriver.GitVcsDriver;
+      yield* git(cwd, ["checkout", "-b", "topic"]);
+      yield* git(remote, ["init", "--bare"]);
+      yield* git(cwd, ["remote", "add", "origin", remote]);
+      const ran = NodePath.join(yield* makeTmpDir("git-hook-ran-"), "ran");
+      const push = (digest: string | null) =>
+        driver
+          .pushCurrentBranch(cwd, null)
+          .pipe(
+            Effect.provideService(GitVcsDriver.RepositoryHooks, { _tag: "approved-push", digest }),
+          );
+      const hooksRun = () => (NodeFS.existsSync(ran) ? NodeFS.readFileSync(ran, "utf8") : "");
+      return { cwd: NodeFS.realpathSync(cwd), driver, ran, push, hooksRun };
+    });
+
+    it.effect("an approved push runs the approved hook files and no other", () =>
+      Effect.gen(function* () {
+        const repo = yield* repoToPush();
+        const hooksDir = NodePath.join(repo.cwd, ".hooks");
+        yield* git(repo.cwd, ["config", "core.hooksPath", ".hooks"]);
+        NodeFS.mkdirSync(hooksDir);
+        // The approved hook leaves another one beside it while the push is under way.
+        const late = NodePath.join(hooksDir, "reference-transaction");
+        NodeFS.writeFileSync(
+          NodePath.join(hooksDir, "pre-push"),
+          [
+            "#!/bin/sh",
+            `echo pre-push >> '${repo.ran}'`,
+            `printf '#!/bin/sh\\necho late >> %s\\n' '${repo.ran}' > '${late}'`,
+            `chmod +x '${late}'`,
+            "",
+          ].join("\n"),
+          { mode: 0o755 },
+        );
+        const approved = yield* repo.driver.pushHooks(repo.cwd);
+        assert.deepEqual(approved?.files, [NodePath.join(hooksDir, "pre-push")]);
+
+        assert.deepInclude(yield* repo.push(approved!.digest), { status: "pushed" });
+        assert.isTrue(NodeFS.existsSync(late));
+        assert.equal(repo.hooksRun(), "pre-push\n");
+      }),
+    );
+
+    // The files husky 9.1.7 installs: `_/pre-push` is what Git runs, `_/h` is its runner.
+    const HUSKY_SHIM = '#!/usr/bin/env sh\n. "$(dirname "$0")/h"';
+    const HUSKY_RUNNER = [
+      "#!/usr/bin/env sh",
+      '[ "$HUSKY" = "2" ] && set -x',
+      'n=$(basename "$0")',
+      's=$(dirname "$(dirname "$0")")/$n',
+      "",
+      '[ ! -f "$s" ] && exit 0',
+      "",
+      'if [ -f "$HOME/.huskyrc" ]; then',
+      "\techo \"husky - '~/.huskyrc' is DEPRECATED, please move your code to ~/.config/husky/init.sh\"",
+      "fi",
+      'i="${XDG_CONFIG_HOME:-$HOME/.config}/husky/init.sh"',
+      '[ -f "$i" ] && . "$i"',
+      "",
+      '[ "${HUSKY-}" = "0" ] && exit 0',
+      "",
+      'export PATH="node_modules/.bin:$PATH"',
+      'sh -e "$s" "$@"',
+      "c=$?",
+      "",
+      '[ $c != 0 ] && echo "husky - $n script failed (code $c)"',
+      '[ $c = 127 ] && echo "husky - command not found in PATH=$PATH"',
+      "exit $c",
+      "",
+    ].join("\n");
+
+    it.effect("an approval of a husky hook covers the script husky runs for it", () =>
+      Effect.gen(function* () {
+        const repo = yield* repoToPush();
+        const husky = NodePath.join(repo.cwd, ".husky");
+        yield* git(repo.cwd, ["config", "core.hooksPath", ".husky/_"]);
+        NodeFS.mkdirSync(NodePath.join(husky, "_"), { recursive: true });
+        NodeFS.writeFileSync(NodePath.join(husky, "_", "pre-push"), HUSKY_SHIM, { mode: 0o755 });
+        NodeFS.writeFileSync(NodePath.join(husky, "_", "h"), HUSKY_RUNNER);
+        // The project's own script finds a file beside itself, and the runner one beside `$0`.
+        NodeFS.writeFileSync(NodePath.join(husky, "label.sh"), "label=first\n");
+        const writeScript = (word: string) =>
+          NodeFS.writeFileSync(
+            NodePath.join(husky, "pre-push"),
+            `. "$(dirname "$0")/label.sh"\necho "${word} $label $1" >> '${repo.ran}'\n`,
+          );
+        writeScript("ran");
+
+        const approved = yield* repo.driver.pushHooks(repo.cwd);
+        assert.deepEqual(approved?.files, [
+          NodePath.join(husky, "_", "pre-push"),
+          NodePath.join(husky, "_", "h"),
+          NodePath.join(husky, "pre-push"),
+        ]);
+
+        // Editing the script, not the file Git runs, is a change to what was approved.
+        writeScript("edited");
+        const refused = yield* repo.push(approved!.digest).pipe(Effect.flip);
+        assert.instanceOf(refused.cause, GitVcsDriver.PushHooksUnapprovedError);
+        assert.equal(repo.hooksRun(), "");
+
+        const current = yield* repo.driver.pushHooks(repo.cwd);
+        assert.notEqual(current?.digest, approved?.digest);
+        assert.deepInclude(yield* repo.push(current!.digest), { status: "pushed" });
+        assert.equal(repo.hooksRun(), "edited first origin\n");
+      }),
+    );
+
     it.effect("pushes to the requested remote instead of the primary remote", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();

@@ -8,9 +8,10 @@ import * as NodeChildProcess from "node:child_process";
 
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { it } from "@effect/vitest";
+import { describe, it } from "@effect/vitest";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
@@ -5200,6 +5201,155 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
         ).toBe(true);
       }),
   );
+
+  describe("createPullRequest and the repository's push hooks", () => {
+    /** A feature branch with one unpushed commit, and hooks kept in the checkout as husky does. */
+    const hookedRepo = Effect.fn(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "main"]);
+      yield* runGit(repoDir, ["config", "core.hooksPath", ".husky"]);
+      yield* runGit(repoDir, ["checkout", "-b", "feature/hooked"]);
+      NodeFS.writeFileSync(NodePath.join(repoDir, "first.txt"), "first\n");
+      yield* runGit(repoDir, ["add", "first.txt"]);
+      yield* runGit(repoDir, ["commit", "-m", "First commit"]);
+      NodeFS.mkdirSync(NodePath.join(repoDir, ".husky"));
+      const ran = NodePath.join(yield* makeTempDir("t3code-hook-ran-"), "ran");
+      const writeHook = (name: string, label = name) =>
+        NodeFS.writeFileSync(
+          NodePath.join(repoDir, ".husky", name),
+          `#!/bin/sh\necho ${label} >> '${ran}'\n`,
+          { mode: 0o755 },
+        );
+      const hooksRun = () =>
+        NodeFS.existsSync(ran) ? [...new Set(NodeFS.readFileSync(ran, "utf8").split("\n"))] : [];
+      const pushed = runGit(repoDir, ["ls-remote", "origin", "refs/heads/feature/hooked"]).pipe(
+        Effect.map((result) => result.stdout.trim() !== ""),
+      );
+      const { manager } = yield* makeManager({
+        providerScenario: { prListSequence: [[], [], [], []] },
+      });
+      const create = (pushHooks?: { readonly approvedDigest: string | null } | "off") =>
+        manager.createPullRequest({
+          cwd: repoDir,
+          projectId: ProjectId.make("project-1"),
+          title: "Feature",
+          body: "Body",
+          pushHooks,
+        });
+      const isRefusedForHooks = Schema.is(GitManager.GitPushHooksUnapprovedError);
+      /** The create that was refused for its hooks, as the caller that asks would read it. */
+      const refused = (pushHooks: { readonly approvedDigest: string | null }) =>
+        create(pushHooks).pipe(
+          Effect.flip,
+          Effect.filterOrElse(isRefusedForHooks, (error) =>
+            Effect.die(new Error(`Expected a refusal for the hooks, got ${error.message}`)),
+          ),
+        );
+      return { repoDir, remoteDir, writeHook, hooksRun, pushed, create, refused };
+    });
+
+    it.effect("runs them for a caller that needs no approval", () =>
+      Effect.gen(function* () {
+        const repo = yield* hookedRepo();
+        repo.writeHook("pre-push");
+        yield* repo.create();
+        expect(repo.hooksRun()).toContain("pre-push");
+        expect(yield* repo.pushed).toBe(true);
+      }),
+    );
+
+    it.effect("pushes nothing and runs none until they are approved", () =>
+      Effect.gen(function* () {
+        const repo = yield* hookedRepo();
+        repo.writeHook("pre-push");
+        repo.writeHook("reference-transaction");
+        const unapproved = yield* repo.refused({ approvedDigest: null });
+        expect(unapproved).toMatchObject({
+          _tag: "GitPushHooksUnapprovedError",
+          branch: "feature/hooked",
+          files: [
+            NodePath.join(NodeFS.realpathSync(repo.repoDir), ".husky", "pre-push"),
+            NodePath.join(NodeFS.realpathSync(repo.repoDir), ".husky", "reference-transaction"),
+          ],
+        });
+        expect(repo.hooksRun()).toEqual([]);
+        expect(yield* repo.pushed).toBe(false);
+
+        // Approved as they are: both run, and the branch is pushed.
+        yield* repo.create({ approvedDigest: unapproved.digest });
+        expect(repo.hooksRun()).toEqual(
+          expect.arrayContaining(["pre-push", "reference-transaction"]),
+        );
+        expect(yield* repo.pushed).toBe(true);
+      }),
+    );
+
+    it.effect("an approval does not carry to hooks edited afterwards", () =>
+      Effect.gen(function* () {
+        const repo = yield* hookedRepo();
+        repo.writeHook("pre-push");
+        const first = yield* repo.refused({ approvedDigest: null });
+        repo.writeHook("pre-push", "edited");
+        const second = yield* repo.refused({ approvedDigest: first.digest });
+        expect(second.digest).not.toBe(first.digest);
+        expect(repo.hooksRun()).toEqual([]);
+        expect(yield* repo.pushed).toBe(false);
+      }),
+    );
+
+    it.effect("pushes with hooks off when asked to", () =>
+      Effect.gen(function* () {
+        const repo = yield* hookedRepo();
+        repo.writeHook("pre-push");
+        repo.writeHook("reference-transaction");
+        yield* repo.create("off");
+        expect(repo.hooksRun()).toEqual([]);
+        expect(yield* repo.pushed).toBe(true);
+      }),
+    );
+
+    // The remote's own hook runs while the push is under way, long after the hooks were read.
+    const addsHookDuringPush = (repo: { readonly repoDir: string; readonly remoteDir: string }) => {
+      const late = NodePath.join(repo.repoDir, ".husky", "reference-transaction");
+      const ran = NodePath.join(
+        repo.repoDir,
+        "..",
+        `late-hook-ran-${NodePath.basename(repo.repoDir)}`,
+      );
+      NodeFS.writeFileSync(
+        NodePath.join(repo.remoteDir, "hooks", "pre-receive"),
+        `#!/bin/sh\nprintf '#!/bin/sh\\necho late >> %s\\n' '${ran}' > '${late}'\nchmod +x '${late}'\n`,
+        { mode: 0o755 },
+      );
+      return () => NodeFS.existsSync(ran);
+    };
+
+    it.effect("a hook that appears after the push starts does not run", () =>
+      Effect.gen(function* () {
+        const repo = yield* hookedRepo();
+        const lateHookRan = addsHookDuringPush(repo);
+        // No hook to run, so no approval is needed.
+        yield* repo.create({ approvedDigest: null });
+        expect(yield* repo.pushed).toBe(true);
+        expect(
+          NodeFS.existsSync(NodePath.join(repo.repoDir, ".husky", "reference-transaction")),
+        ).toBe(true);
+        expect(lateHookRan()).toBe(false);
+      }),
+    );
+
+    it.effect("the same late hook runs for a caller that needs no approval", () =>
+      Effect.gen(function* () {
+        const repo = yield* hookedRepo();
+        const lateHookRan = addsHookDuringPush(repo);
+        yield* repo.create();
+        expect(lateHookRan()).toBe(true);
+      }),
+    );
+  });
 
   it.effect("createPullRequest pushes the branch before opening its PR", () =>
     Effect.gen(function* () {
