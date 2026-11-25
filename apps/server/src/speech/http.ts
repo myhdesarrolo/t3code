@@ -1,4 +1,4 @@
-import { decodeSpeechPcmRequest } from "@t3tools/shared/speech";
+import { cloudSpeechLanguages, decodeSpeechPcmRequest } from "@t3tools/shared/speech";
 import {
   AuthFilesystemReadScope,
   AuthOrchestrationOperateScope,
@@ -150,6 +150,30 @@ export const speechHttpApiLayer = HttpApiBuilder.group(
         "status",
         Effect.fn("environment.voice.status")(function* (args) {
           yield* guard(args.endpoint.name);
+          if (process.env.T3_GEMINI_STT_FOR_LOCAL === "1") {
+            const keys = yield* cloud.configured.pipe(
+              Effect.catch((error) => failEnvironmentInternal("internal_error", error)),
+            );
+            if (keys.google) {
+              return {
+                supported: true as const,
+                state: "ready" as const,
+                modelId: "gemini-3.5-transcribe",
+                model: "Gemini 3.5 Transcribe",
+                size: 0,
+                supportsStreaming: false,
+                supportsBufferedStreaming: false,
+                supportsModelLinking: false,
+                supportsTranslation: false,
+                languages: cloudSpeechLanguages.languages,
+                supportsLanguageDetection: true,
+                acceleration: "auto" as const,
+                benchmarkTier: "accelerated" as const,
+                modelUnloadTimeout: "never" as const,
+                gpuDevices: [],
+              };
+            }
+          }
           return yield* speech.status.pipe(mapSpeechError);
         }),
       )
@@ -234,6 +258,24 @@ export const speechHttpApiLayer = HttpApiBuilder.group(
           yield* guard(args.endpoint.name);
           const decoded = parseAudio(args.payload);
           if (Option.isNone(decoded)) return yield* failEnvironmentInvalidRequest("invalid_audio");
+          if (process.env.T3_GEMINI_STT_FOR_LOCAL === "1") {
+            const keys = yield* cloud.configured.pipe(
+              Effect.catch((error) => failEnvironmentInternal("internal_error", error)),
+            );
+            if (keys.google) {
+              const text = yield* cloud
+                .transcribe("google", decoded.value.pcm, decoded.value.options)
+                .pipe(
+                  Effect.catchTags({
+                    CloudSpeechError: (error) => failEnvironmentInternal("internal_error", error),
+                    ServerSettingsError: (error) =>
+                      failEnvironmentInternal("internal_error", error),
+                    SpeechInvalidAudioError: () => failEnvironmentInvalidRequest("invalid_audio"),
+                  }),
+                );
+              return { text };
+            }
+          }
           const text = yield* speech
             .transcribe(decoded.value.pcm, decoded.value.options)
             .pipe(mapSpeechError);
